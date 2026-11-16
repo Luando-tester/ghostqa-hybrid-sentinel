@@ -4,9 +4,12 @@ import {
   extractCandidateNodesFromDocument,
   SAMPLE_CANDIDATES,
 } from "./scanner/domExtractor";
-import { triageElementOnDevice, generateCloudPatch } from "./scanner/hybridAuditor";
+import {
+  prepareHybridScanner,
+  triageElementOnDevice,
+  generateCloudPatch,
+} from "./scanner/hybridAuditor";
 
-// Ước tính chi phí tiết kiệm được cho mỗi element triage on-device thay vì gọi Cloud LLM (~$0.0004/call)
 const ESTIMATED_CLOUD_COST_PER_CHECK_USD = 0.0004;
 
 export default function App() {
@@ -16,8 +19,9 @@ export default function App() {
     status: "checking",
     reason: "Đang kiểm tra Chrome Gemini Nano...",
   });
+  const [initProgress, setInitProgress] = useState("");
   const [scanning, setScanning] = useState(false);
-  const [bugs, setBugs] = useState([]);
+  const [results, setResults] = useState([]);
   const [onDeviceCount, setOnDeviceCount] = useState(0);
   const [generatingFix, setGeneratingFix] = useState(false);
   const [patchResult, setPatchResult] = useState(null);
@@ -25,7 +29,6 @@ export default function App() {
   useEffect(() => {
     checkOnDeviceSupport().then(setDeviceInfo);
 
-    // Nếu chạy dưới dạng Chrome Extension, tự động lấy URL của tab hiện tại
     if (typeof chrome !== "undefined" && chrome.tabs?.query) {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         if (tabs?.[0]?.url) setUrl(tabs[0].url);
@@ -35,12 +38,16 @@ export default function App() {
 
   async function handleStartScan() {
     setScanning(true);
-    setBugs([]);
+    setResults([]);
     setPatchResult(null);
+
+    // Gọi initializeDeviceModel() sau hành động click của người dùng
+    await prepareHybridScanner((progressMsg) => {
+      setInitProgress(progressMsg);
+    });
 
     let candidates = [];
 
-    // Nhánh 1: Chạy trong Chrome Extension -> tiêm script vào tab đang mở để quét DOM thật
     if (typeof chrome !== "undefined" && chrome.tabs?.query && chrome.scripting?.executeScript) {
       try {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -56,35 +63,41 @@ export default function App() {
       }
     }
 
-    // Nhánh 2: Chạy ở Web Dashboard hoặc tab chrome:// -> quét DOM hiện tại + sample candidates
     if (candidates.length === 0) {
       const localDom = extractCandidateNodesFromDocument();
       candidates = localDom.length > 0 ? localDom : SAMPLE_CANDIDATES;
     }
 
-    const detected = [];
-    let localExecutions = 0;
+    const collected = [];
 
     for (const item of candidates) {
-      const verdict = await triageElementOnDevice(item.htmlSnippet, item.issueType);
-      if (verdict.inferenceSource === "on-device") {
-        localExecutions += 1;
+      const verdict = await triageElementOnDevice(
+        item.htmlSnippet,
+        item.issueType,
+        setInitProgress
+      );
+
+      // Chỉ đếm local check khi chạy thành công bằng on-device và không có lỗi
+      if (verdict.inferenceSource === "on-device" && !verdict.error) {
         setOnDeviceCount((prev) => prev + 1);
       }
-      if (verdict.isBug) {
-        detected.push({ ...item, ...verdict });
-        setBugs([...detected]);
+
+      if (verdict.isBug || verdict.error) {
+        collected.push({ ...item, ...verdict });
+        setResults([...collected]);
       }
     }
 
     setScanning(false);
   }
 
+  const validBugs = results.filter((r) => r.isBug && !r.error);
+
   async function handleGenerateDeepFix() {
-    if (bugs.length === 0) return;
+    if (validBugs.length === 0) return;
     setGeneratingFix(true);
     try {
-      const res = await generateCloudPatch(url, bugs);
+      const res = await generateCloudPatch(url, validBugs);
       setPatchResult(res);
     } finally {
       setGeneratingFix(false);
@@ -92,6 +105,39 @@ export default function App() {
   }
 
   const savedUsd = (onDeviceCount * ESTIMATED_CLOUD_COST_PER_CHECK_USD).toFixed(4);
+
+  function getBadgeStyle(source) {
+    if (source === "on-device") {
+      return {
+        label: "ON-DEVICE",
+        background: "#064e3b",
+        color: "#34d399",
+        border: "1px solid #10b981",
+      };
+    }
+    if (source === "cloud") {
+      return {
+        label: "CLOUD",
+        background: "#1e3a8a",
+        color: "#93c5fd",
+        border: "1px solid #3b82f6",
+      };
+    }
+    if (source === "error") {
+      return {
+        label: "AI ERROR",
+        background: "#450a0a",
+        color: "#fca5a5",
+        border: "1px solid #ef4444",
+      };
+    }
+    return {
+      label: "DEMO",
+      background: "#3f3f46",
+      color: "#d4d4d8",
+      border: "1px solid #71717a",
+    };
+  }
 
   return (
     <div style={{ maxWidth: 760, minWidth: 420, margin: "0 auto", padding: 16 }}>
@@ -102,7 +148,7 @@ export default function App() {
             GhostQA Local-First Sentinel
           </h2>
           <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 2 }}>
-            {deviceInfo.reason}
+            {initProgress || deviceInfo.reason}
           </div>
         </div>
         <div
@@ -172,45 +218,52 @@ export default function App() {
         </button>
       </div>
 
-      {/* Bug List */}
+      {/* Results List */}
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-        {bugs.map((bug) => {
-          const isLocal = bug.inferenceSource === "on-device";
+        {results.map((item) => {
+          const badge = getBadgeStyle(item.inferenceSource);
+          const isError = Boolean(item.error);
+
           return (
             <div
-              key={bug.id}
+              key={item.id}
               style={{
-                background: "#111827",
-                border: "1px solid #1f2937",
+                background: isError ? "#1f1216" : "#111827",
+                border: isError ? "1px solid #7f1d1d" : "1px solid #1f2937",
                 borderRadius: 8,
                 padding: 12,
               }}
             >
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  {/* Badge ON-DEVICE (xanh lá) / CLOUD (xanh dương) */}
                   <span
                     style={{
                       padding: "2px 8px",
                       borderRadius: 999,
                       fontSize: 11,
                       fontWeight: 700,
-                      background: isLocal ? "#064e3b" : "#1e3a8a",
-                      color: isLocal ? "#34d399" : "#93c5fd",
-                      border: `1px solid ${isLocal ? "#10b981" : "#3b82f6"}`,
+                      background: badge.background,
+                      color: badge.color,
+                      border: badge.border,
                     }}
                   >
-                    {isLocal ? "ON-DEVICE" : "CLOUD"} • {bug.latencyMs}ms
+                    {badge.label} • {item.latencyMs}ms
                   </span>
-                  <span style={{ fontSize: 12, fontWeight: 600, color: "#f59e0b" }}>
-                    [{bug.severity.toUpperCase()}] {bug.issueType}
+                  <span
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 600,
+                      color: isError ? "#f87171" : "#f59e0b",
+                    }}
+                  >
+                    {isError ? `[FAILED] ${item.issueType}` : `[${item.severity.toUpperCase()}] ${item.issueType}`}
                   </span>
                 </div>
-                <code style={{ fontSize: 11, color: "#94a3b8" }}>{bug.selector}</code>
+                <code style={{ fontSize: 11, color: "#94a3b8" }}>{item.selector}</code>
               </div>
 
-              <p style={{ margin: "8px 0 6px", fontSize: 13, color: "#e2e8f0" }}>
-                {bug.shortReason}
+              <p style={{ margin: "8px 0 6px", fontSize: 13, color: isError ? "#fecaca" : "#e2e8f0" }}>
+                {item.error ? `Error: ${item.error}` : item.shortReason}
               </p>
 
               <pre
@@ -224,7 +277,7 @@ export default function App() {
                   overflowX: "auto",
                 }}
               >
-                {bug.htmlSnippet}
+                {item.htmlSnippet}
               </pre>
             </div>
           );
@@ -232,7 +285,7 @@ export default function App() {
       </div>
 
       {/* Deep Fix Action */}
-      {bugs.length > 0 && (
+      {validBugs.length > 0 && (
         <div style={{ marginTop: 16 }}>
           <button
             onClick={handleGenerateDeepFix}
@@ -251,7 +304,7 @@ export default function App() {
           >
             {generatingFix
               ? "Calling Firebase Cloud (Gemini 2.5 Flash)..."
-              : `Generate Deep Fix (${bugs.length} issues via Cloud AI)`}
+              : `Generate Deep Fix (${validBugs.length} issues via Cloud AI)`}
           </button>
         </div>
       )}
@@ -261,27 +314,35 @@ export default function App() {
         <div
           style={{
             marginTop: 16,
-            background: "#0f172a",
-            border: "1px solid #3b82f6",
+            background: patchResult.error ? "#1f1216" : "#0f172a",
+            border: patchResult.error ? "1px solid #ef4444" : "1px solid #3b82f6",
             borderRadius: 8,
             padding: 12,
           }}
         >
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-            <span style={{ fontSize: 12, fontWeight: 700, color: "#93c5fd" }}>
-              UNIFIED DIFF PATCH (CLOUD • {patchResult.latencyMs}ms)
+            <span
+              style={{
+                fontSize: 12,
+                fontWeight: 700,
+                color: patchResult.error ? "#fca5a5" : "#93c5fd",
+              }}
+            >
+              {patchResult.error
+                ? `CLOUD DEEP FIX FAILED • ${patchResult.latencyMs}ms`
+                : `UNIFIED DIFF PATCH (CLOUD • ${patchResult.latencyMs}ms)`}
             </span>
           </div>
           <pre
             style={{
               margin: 0,
               fontSize: 12,
-              color: "#e2e8f0",
+              color: patchResult.error ? "#fecaca" : "#e2e8f0",
               whiteSpace: "pre-wrap",
               overflowX: "auto",
             }}
           >
-            {patchResult.patchDiff}
+            {patchResult.error ? patchResult.error : patchResult.patchDiff}
           </pre>
         </div>
       )}

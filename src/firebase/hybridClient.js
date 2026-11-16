@@ -7,7 +7,6 @@ import {
   InferenceMode,
 } from "firebase/ai";
 
-// CẦN ĐIỀN CONFIG THẬT TỪ FIREBASE CONSOLE (Project Settings -> General -> Your apps)
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "YOUR_FIREBASE_API_KEY",
   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "YOUR_PROJECT_ID.firebaseapp.com",
@@ -21,19 +20,27 @@ export const isFirebaseConfigured =
   firebaseConfig.apiKey !== "YOUR_FIREBASE_API_KEY" &&
   firebaseConfig.projectId !== "YOUR_PROJECT_ID";
 
-// Bật App Check Debug Token khi chạy localhost / unpacked extension (bắt buộc từ tháng 7/2026)
-if (import.meta.env.DEV || import.meta.env.VITE_APPCHECK_DEBUG === "true") {
+// Chỉ bật App Check Debug Token khi đang chạy ở localhost (tuyệt đối không bật trên domain public như Railway)
+const isLocalhost =
+  typeof window !== "undefined" &&
+  (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
+
+if (isLocalhost && import.meta.env.VITE_APPCHECK_DEBUG === "true") {
   self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
 }
 
 const app = initializeApp(firebaseConfig);
 
-// Khởi tạo App Check nếu có Site Key (để vượt qua enforcement mặc định của Firebase AI Logic)
+// Khởi tạo App Check chỉ khi có reCAPTCHA Enterprise Site Key hợp lệ
 if (isFirebaseConfigured && import.meta.env.VITE_RECAPTCHA_SITE_KEY) {
-  initializeAppCheck(app, {
-    provider: new ReCaptchaEnterpriseProvider(import.meta.env.VITE_RECAPTCHA_SITE_KEY),
-    isTokenAutoRefreshEnabled: true,
-  });
+  try {
+    initializeAppCheck(app, {
+      provider: new ReCaptchaEnterpriseProvider(import.meta.env.VITE_RECAPTCHA_SITE_KEY),
+      isTokenAutoRefreshEnabled: true,
+    });
+  } catch (err) {
+    console.warn("App Check init skipped:", err.message);
+  }
 }
 
 const ai = getAI(app, { backend: new GoogleAIBackend() });
@@ -59,7 +66,6 @@ let deviceModelInitPromise = null;
 /**
  * BẮT BUỘC gọi sau khi user tương tác (ví dụ trong handler nút Start Scan)
  * và TRƯỚC khi gọi localFirstModel.generateContent().
- * @param {(progressMsg: string) => void} onProgress - Callback báo tiến độ tải Gemini Nano
  */
 export async function ensureDeviceModelInitialized(onProgress) {
   if (!isFirebaseConfigured) {
@@ -86,9 +92,8 @@ export async function ensureDeviceModelInitialized(onProgress) {
       onProgress?.("On-Device Gemini Nano đã sẵn sàng.");
       return { ready: true, reason: "On-Device Gemini Nano sẵn sàng." };
     } catch (err) {
-      // Reset promise để user có thể thử lại nếu cần, đồng thời cho phép PREFER_ON_DEVICE fallback sang Cloud
       deviceModelInitPromise = null;
-      const msg = `On-device không khả dụng (${err.message}). Đang dùng Cloud Fallback.`;
+      const msg = `On-device không khả dụng (${err.message}). Sẽ dùng Cloud Fallback.`;
       onProgress?.(msg);
       return { ready: false, reason: msg };
     }
@@ -116,7 +121,7 @@ export async function checkOnDeviceSupport() {
     return {
       supported: false,
       status: "unsupported",
-      reason: "Trình duyệt không hỗ trợ Prompt API (cần Chrome Desktop v139+). Đang dùng Cloud Fallback.",
+      reason: "Trình duyệt không hỗ trợ Prompt API (cần Chrome Desktop v139+). Sẽ dùng Cloud Fallback.",
     };
   } catch (err) {
     return {

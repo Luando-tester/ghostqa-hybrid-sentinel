@@ -18,24 +18,23 @@ export async function prepareHybridScanner(onProgress) {
 
 /**
  * Triage từng phần tử DOM bằng mô hình Hybrid (PREFER_ON_DEVICE -> fallback ONLY_IN_CLOUD).
- * Trả về: { isBug, severity, shortReason, inferenceSource, latencyMs }
+ * Trả về: { isBug, severity, shortReason, inferenceSource, latencyMs, error }
  */
 export async function triageElementOnDevice(htmlSnippet, issueType, onProgress) {
   const t0 = performance.now();
 
-  // Đảm bảo đã chạy initializeDeviceModel() sau thao tác click trước khi generateContent()
   if (!lastDeviceInitStatus.ready && isFirebaseConfigured) {
     await prepareHybridScanner(onProgress);
   }
 
-  // Nếu chưa điền Firebase config và không có on-device model -> trả demo fallback để test UI
   if (!isFirebaseConfigured && !lastDeviceInitStatus.ready) {
     return {
       isBug: true,
       severity: "medium",
       shortReason: `[Demo Fallback] ${issueType} detected (chưa cấu hình Firebase API key).`,
-      inferenceSource: "on-device",
+      inferenceSource: "demo",
       latencyMs: Math.max(4, Math.round(performance.now() - t0)),
+      error: null,
     };
   }
 
@@ -76,15 +75,17 @@ ${htmlSnippet.slice(0, 600)}`;
       shortReason: parsed.shortReason || `Detected ${issueType} issue.`,
       inferenceSource,
       latencyMs,
+      error: null,
     };
   } catch (err) {
     const latencyMs = Math.round(performance.now() - t0);
     return {
-      isBug: true,
-      severity: "medium",
-      shortReason: `Fallback audit (${issueType}): ${err.message.slice(0, 60)}`,
-      inferenceSource: lastDeviceInitStatus.ready ? "on-device" : "cloud",
+      isBug: false,
+      severity: "high",
+      shortReason: `AI audit failed (${issueType}): ${err.message}`,
+      inferenceSource: "error",
       latencyMs,
+      error: err.message || "Unknown AI inference error",
     };
   }
 }
@@ -108,8 +109,9 @@ export async function generateCloudPatch(targetUrl, confirmedBugs) {
 
     return {
       patchDiff: `# [DEMO MODE - Điền VITE_FIREBASE_API_KEY để gọi Gemini 2.5 Flash thật]\n\n${mockDiff}`,
-      inferenceSource: "cloud",
+      inferenceSource: "demo",
       latencyMs: Math.round(performance.now() - t0),
+      error: null,
     };
   }
 
@@ -130,12 +132,23 @@ ${JSON.stringify(
 
 Generate a clean, production-ready unified diff patch (\`\`\`diff ... \`\`\`) fixing all confirmed issues above. Keep explanations minimal.`;
 
-  const result = await cloudDeepModel.generateContent(prompt);
-  const latencyMs = Math.round(performance.now() - t0);
+  try {
+    const result = await cloudDeepModel.generateContent(prompt);
+    const latencyMs = Math.round(performance.now() - t0);
 
-  return {
-    patchDiff: result.response.text(),
-    inferenceSource: "cloud",
-    latencyMs,
-  };
+    return {
+      patchDiff: result.response.text(),
+      inferenceSource: "cloud",
+      latencyMs,
+      error: null,
+    };
+  } catch (err) {
+    const latencyMs = Math.round(performance.now() - t0);
+    return {
+      patchDiff: null,
+      inferenceSource: "error",
+      latencyMs,
+      error: err.message || "Failed to generate cloud patch",
+    };
+  }
 }
