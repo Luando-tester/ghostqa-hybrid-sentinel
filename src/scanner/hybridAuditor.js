@@ -1,17 +1,19 @@
 import {
   localFirstModel,
-  cloudDeepModel,
+  getCloudModel,
+  CLOUD_MODEL_CANDIDATES,
   ensureDeviceModelInitialized,
   isFirebaseConfigured,
 } from "../firebase/hybridClient";
 
-const ON_DEVICE_WARMUP_TIMEOUT_MS = 35000;
-const ON_DEVICE_STEP_TIMEOUT_MS = 12000;
-const CLOUD_RESCUE_TIMEOUT_MS = 15000;
+const ON_DEVICE_WARMUP_TIMEOUT_MS = 8000;
+const ON_DEVICE_STEP_TIMEOUT_MS = 10000;
+const CLOUD_STEP_TIMEOUT_MS = 15000;
 
 let lastDeviceInitStatus = { ready: false, reason: "Chưa khởi tạo" };
 let onDeviceHealthy = false;
 let isWarmedUp = false;
+let activeCloudModelName = CLOUD_MODEL_CANDIDATES[0];
 
 function withTimeout(promise, ms, label = "timeout") {
   let timerId;
@@ -31,20 +33,64 @@ export function isOnDeviceActive() {
 }
 
 /**
+ * Gọi Cloud AI với cơ chế tự động chuyển sang model dự phòng trong danh sách
+ * CLOUD_MODEL_CANDIDATES nếu gặp lỗi 404 / not available.
+ */
+async function generateCloudWithModelFallback(prompt, timeoutMs = CLOUD_STEP_TIMEOUT_MS) {
+  const orderedModels = [
+    activeCloudModelName,
+    ...CLOUD_MODEL_CANDIDATES.filter((m) => m !== activeCloudModelName),
+  ];
+
+  let lastError = null;
+
+  for (const modelName of orderedModels) {
+    try {
+      const model = getCloudModel(modelName);
+      const res = await withTimeout(
+        model.generateContent(prompt),
+        timeoutMs,
+        `Cloud (${modelName}) timeout`
+      );
+      activeCloudModelName = modelName;
+      return { response: res.response, modelName };
+    } catch (err) {
+      lastError = err;
+      const msg = (err?.message || "").toLowerCase();
+      // Nếu lỗi do tên model không khả dụng (404 / not found / no longer available) -> thử model kế tiếp
+      // Timeout cũng thử model kế tiếp: lần test trước gemini-3.8-flash timeout 15s dù tên model hợp lệ
+      // theo tài liệu chính thức (firebase.google.com/docs/ai-logic/models), nên timeout có thể do
+      // backend chậm/quá tải chứ không phải do tên model sai.
+      const isModelIssue =
+        msg.includes("404") ||
+        msg.includes("not found") ||
+        msg.includes("no longer available") ||
+        msg.includes("not supported") ||
+        msg.includes("timeout");
+      if (!isModelIssue) {
+        throw err;
+      }
+    }
+  }
+
+  throw lastError || new Error("Tất cả Cloud model đều thất bại.");
+}
+
+/**
  * Gọi hàm này đầu tiên trong handler của nút Start Scan (sau user gesture).
- * Khởi tạo device model + chạy 1 warm-up prompt ngắn để nạp trọng số vào RAM/VRAM.
  */
 export async function prepareHybridScanner(onProgress) {
   lastDeviceInitStatus = await ensureDeviceModelInitialized(onProgress);
 
   if (!lastDeviceInitStatus.ready) {
     onDeviceHealthy = false;
+    onProgress?.(lastDeviceInitStatus.reason);
     return { ready: false, onDeviceHealthy: false, reason: lastDeviceInitStatus.reason };
   }
 
   if (!isWarmedUp) {
     try {
-      onProgress?.("Đang nạp Gemini Nano vào bộ nhớ (warm-up)...");
+      onProgress?.("Đang nạp Gemini Nano vào bộ nhớ (tối đa 8s)...");
       await withTimeout(
         localFirstModel.generateContent("Reply with one word: OK"),
         ON_DEVICE_WARMUP_TIMEOUT_MS,
@@ -52,10 +98,10 @@ export async function prepareHybridScanner(onProgress) {
       );
       isWarmedUp = true;
       onDeviceHealthy = true;
-      onProgress?.("On-Device Gemini Nano đã nạp xong & sẵn sàng.");
+      onProgress?.("On-Device Gemini Nano đã sẵn sàng.");
     } catch (err) {
       onDeviceHealthy = false;
-      onProgress?.(`On-device phản hồi chậm (${err.message}). Tự động chuyển sang Cloud Rescue.`);
+      onProgress?.(`On-device không phản hồi (${err.message}). Chuyển sang Cloud (${activeCloudModelName}).`);
     }
   }
 
@@ -64,7 +110,7 @@ export async function prepareHybridScanner(onProgress) {
     onDeviceHealthy,
     reason: onDeviceHealthy
       ? "On-Device Gemini Nano sẵn sàng."
-      : "Đang dùng Cloud AI (gemini-3.8-flash) do On-Device chậm.",
+      : `Đang dùng Cloud AI (${activeCloudModelName}).`,
   };
 }
 
@@ -83,15 +129,14 @@ export async function runDiagnosticCheck() {
   const cloudCheck = (async () => {
     const t0 = performance.now();
     try {
-      const res = await withTimeout(
-        cloudDeepModel.generateContent("Reply with one word: PONG"),
-        CLOUD_RESCUE_TIMEOUT_MS,
-        "Cloud timeout"
+      const { response, modelName } = await generateCloudWithModelFallback(
+        "Reply with one word: PONG",
+        CLOUD_STEP_TIMEOUT_MS
       );
       return {
         ok: true,
         latencyMs: Math.round(performance.now() - t0),
-        detail: `OK (${res.response.text().trim().slice(0, 20)})`,
+        detail: `OK [${modelName}] (${response.text().trim().slice(0, 20)})`,
       };
     } catch (err) {
       return {
@@ -102,7 +147,7 @@ export async function runDiagnosticCheck() {
     }
   })();
 
-  // 2. Test riêng đường On-Device
+  // 2. Test riêng đường On-Device (chỉ chạy nếu availability là "readily" hoặc "available")
   const deviceCheck = (async () => {
     const t0 = performance.now();
     try {
@@ -160,9 +205,9 @@ function parseAuditJson(rawText, issueType) {
 
 /**
  * Triage phần tử DOM:
- * - Bước 1: Nếu onDeviceHealthy == true, chạy localFirstModel với timeout 12s.
- * - Bước 2: Nếu on-device timeout/lỗi (hoặc không khỏe), tự động fallback sang cloudDeepModel (timeout 15s).
- * - Chỉ trả về inferenceSource: "error" nếu CẢ HAI đường đều thất bại.
+ * - Đường 1: Nếu onDeviceHealthy == true, chạy localFirstModel với timeout 10s.
+ * - Đường 2: Nếu on-device không sẵn sàng / timeout / lỗi, tự động chạy Cloud (timeout 15s).
+ * - Chỉ trả về inferenceSource: "error" nếu Cloud cũng thất bại.
  */
 export async function triageElementOnDevice(htmlSnippet, issueType, onProgress) {
   const t0 = performance.now();
@@ -185,7 +230,7 @@ Respond ONLY with valid JSON (no markdown fences):
 HTML:
 ${htmlSnippet.slice(0, 600)}`;
 
-  // Đường 1: Thử On-Device (nếu đang khỏe) với timeout 12s
+  // Đường 1: Thử On-Device (chỉ khi thực sự sẵn sàng và đã warm-up thành công)
   if (onDeviceHealthy) {
     try {
       const tLocal = performance.now();
@@ -205,22 +250,17 @@ ${htmlSnippet.slice(0, 600)}`;
         error: null,
       };
     } catch (localErr) {
-      // On-device bị chậm/kẹt -> hạ cờ để các element sau đi thẳng Cloud, đồng thời cứu hộ element hiện tại
       onDeviceHealthy = false;
       onProgress?.(`On-device chậm (${localErr.message}), chuyển sang Cloud...`);
     }
   }
 
-  // Đường 2: Cloud Rescue (ONLY_IN_CLOUD) với timeout 15s
+  // Đường 2: Cloud AI (ONLY_IN_CLOUD)
   try {
     const tCloud = performance.now();
-    const cloudResult = await withTimeout(
-      cloudDeepModel.generateContent(prompt),
-      CLOUD_RESCUE_TIMEOUT_MS,
-      "Cloud timeout"
-    );
+    const { response } = await generateCloudWithModelFallback(prompt, CLOUD_STEP_TIMEOUT_MS);
     const latencyMs = Math.round(performance.now() - tCloud);
-    const parsed = parseAuditJson(cloudResult.response.text(), issueType);
+    const parsed = parseAuditJson(response.text(), issueType);
 
     return {
       ...parsed,
@@ -285,15 +325,11 @@ ${JSON.stringify(
 Generate a clean, production-ready unified diff patch (\`\`\`diff ... \`\`\`) fixing all confirmed issues above. Keep explanations minimal.`;
 
   try {
-    const result = await withTimeout(
-      cloudDeepModel.generateContent(prompt),
-      CLOUD_RESCUE_TIMEOUT_MS,
-      "Cloud patch timeout"
-    );
+    const { response } = await generateCloudWithModelFallback(prompt, CLOUD_STEP_TIMEOUT_MS);
     const latencyMs = Math.round(performance.now() - t0);
 
     return {
-      patchDiff: result.response.text(),
+      patchDiff: response.text(),
       inferenceSource: "cloud",
       latencyMs,
       error: null,
