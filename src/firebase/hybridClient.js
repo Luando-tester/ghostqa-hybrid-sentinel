@@ -45,11 +45,11 @@ if (isFirebaseConfigured && import.meta.env.VITE_RECAPTCHA_SITE_KEY) {
 
 const ai = getAI(app, { backend: new GoogleAIBackend() });
 
-// 1. Model Hybrid: Ưu tiên On-Device (Gemini Nano), tự động fallback sang Cloud (gemini-2.5-flash)
+// 1. Model Hybrid: Ưu tiên On-Device (Gemini Nano), tự động fallback sang Cloud (gemini-3.8-flash)
 export const localFirstModel = getGenerativeModel(ai, {
   mode: InferenceMode.PREFER_ON_DEVICE,
   inCloudParams: {
-    model: "gemini-2.5-flash",
+    model: "gemini-3.8-flash",
   },
 });
 
@@ -57,7 +57,7 @@ export const localFirstModel = getGenerativeModel(ai, {
 export const cloudDeepModel = getGenerativeModel(ai, {
   mode: InferenceMode.ONLY_IN_CLOUD,
   inCloudParams: {
-    model: "gemini-2.5-flash",
+    model: "gemini-3.8-flash",
   },
 });
 
