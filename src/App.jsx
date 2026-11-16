@@ -8,10 +8,11 @@ import {
   prepareHybridScanner,
   triageElementOnDevice,
   generateCloudPatch,
+  runDiagnosticCheck,
+  isOnDeviceActive,
 } from "./scanner/hybridAuditor";
 
 const ESTIMATED_CLOUD_COST_PER_CHECK_USD = 0.0004;
-const CONCURRENCY_LIMIT = 4;
 
 export default function App() {
   const [url, setUrl] = useState("http://localhost:3000");
@@ -27,6 +28,8 @@ export default function App() {
   const [onDeviceCount, setOnDeviceCount] = useState(0);
   const [generatingFix, setGeneratingFix] = useState(false);
   const [patchResult, setPatchResult] = useState(null);
+  const [testingDiag, setTestingDiag] = useState(false);
+  const [diagResult, setDiagResult] = useState(null);
 
   useEffect(() => {
     checkOnDeviceSupport().then(setDeviceInfo);
@@ -38,14 +41,25 @@ export default function App() {
     }
   }, []);
 
+  async function handleDiagnosticTest() {
+    setTestingDiag(true);
+    setDiagResult(null);
+    try {
+      const res = await runDiagnosticCheck();
+      setDiagResult(res);
+    } finally {
+      setTestingDiag(false);
+    }
+  }
+
   async function handleStartScan() {
     setScanning(true);
     setResults([]);
     setPatchResult(null);
     setScanProgress({ completed: 0, total: 0 });
 
-    // Gọi initializeDeviceModel() sau hành động click của người dùng
-    await prepareHybridScanner((progressMsg) => {
+    // Khởi tạo & warm-up Gemini Nano trước khi chạy worker pool
+    const prep = await prepareHybridScanner((progressMsg) => {
       setInitProgress(progressMsg);
     });
 
@@ -74,7 +88,9 @@ export default function App() {
     const total = candidates.length;
     setScanProgress({ completed: 0, total });
 
-    // Mảng giữ đúng thứ tự gốc của candidates khi chạy song song
+    // On-device chạy tối đa 2 luồng để không nghẽn GPU cục bộ; Cloud chạy tối đa 4 luồng
+    const concurrency = prep.onDeviceHealthy || isOnDeviceActive() ? 2 : 4;
+
     const orderedResults = new Array(total).fill(null);
     let nextIndex = 0;
     let completedCount = 0;
@@ -105,7 +121,7 @@ export default function App() {
       }
     }
 
-    const workerCount = Math.min(CONCURRENCY_LIMIT, total);
+    const workerCount = Math.min(concurrency, total);
     const workers = Array.from({ length: workerCount }, () => worker());
     await Promise.allSettled(workers);
 
@@ -206,7 +222,31 @@ export default function App() {
         </div>
       )}
 
-      {/* URL Input & Scan Trigger */}
+      {/* Diagnostic Result Box */}
+      {diagResult && (
+        <div
+          style={{
+            background: "#0f172a",
+            border: "1px solid #334155",
+            borderRadius: 6,
+            padding: "8px 12px",
+            fontSize: 12,
+            marginBottom: 12,
+            display: "flex",
+            flexDirection: "column",
+            gap: 4,
+          }}
+        >
+          <div style={{ color: diagResult.cloud.ok ? "#34d399" : "#fca5a5" }}>
+            <strong>Cloud AI:</strong> {diagResult.cloud.ok ? "PASS" : "FAIL"} ({diagResult.cloud.latencyMs}ms) — {diagResult.cloud.detail}
+          </div>
+          <div style={{ color: diagResult.onDevice.ok ? "#34d399" : "#fcd34d" }}>
+            <strong>On-Device Nano:</strong> {diagResult.onDevice.ok ? "PASS" : "FAIL"} ({diagResult.onDevice.latencyMs}ms) — {diagResult.onDevice.detail}
+          </div>
+        </div>
+      )}
+
+      {/* URL Input & Actions */}
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         <input
           type="text"
@@ -224,6 +264,22 @@ export default function App() {
           }}
         />
         <button
+          onClick={handleDiagnosticTest}
+          disabled={testingDiag || scanning}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 6,
+            border: "1px solid #475569",
+            background: "#1e293b",
+            color: "#e2e8f0",
+            fontWeight: 600,
+            cursor: testingDiag || scanning ? "not-allowed" : "pointer",
+            fontSize: 12,
+          }}
+        >
+          {testingDiag ? "Testing..." : "Test AI Paths"}
+        </button>
+        <button
           onClick={handleStartScan}
           disabled={scanning}
           style={{
@@ -240,7 +296,7 @@ export default function App() {
           {scanning
             ? scanProgress.total > 0
               ? `Scanning ${scanProgress.completed}/${scanProgress.total}...`
-              : "Initializing..."
+              : "Warming up..."
             : "Start Scan"}
         </button>
       </div>
