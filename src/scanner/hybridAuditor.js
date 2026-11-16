@@ -5,7 +5,22 @@ import {
   isFirebaseConfigured,
 } from "../firebase/hybridClient";
 
+const INFERENCE_TIMEOUT_MS = 20000;
+
 let lastDeviceInitStatus = { ready: false, reason: "Chưa khởi tạo" };
+
+function withTimeout(promise, ms = INFERENCE_TIMEOUT_MS) {
+  let timerId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timerId = setTimeout(() => {
+      reject(new Error("timeout sau 20s"));
+    }, ms);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timerId);
+  });
+}
 
 /**
  * Gọi hàm này đầu tiên trong handler của nút Start Scan (sau user gesture)
@@ -18,6 +33,7 @@ export async function prepareHybridScanner(onProgress) {
 
 /**
  * Triage từng phần tử DOM bằng mô hình Hybrid (PREFER_ON_DEVICE -> fallback ONLY_IN_CLOUD).
+ * Có giới hạn timeout 20s cho mỗi lời gọi generateContent.
  * Trả về: { isBug, severity, shortReason, inferenceSource, latencyMs, error }
  */
 export async function triageElementOnDevice(htmlSnippet, issueType, onProgress) {
@@ -46,7 +62,10 @@ HTML:
 ${htmlSnippet.slice(0, 600)}`;
 
   try {
-    const result = await localFirstModel.generateContent(prompt);
+    const result = await withTimeout(
+      localFirstModel.generateContent(prompt),
+      INFERENCE_TIMEOUT_MS
+    );
     const latencyMs = Math.round(performance.now() - t0);
     const rawText = result.response.text().replace(/```json|```/g, "").trim();
 
@@ -79,19 +98,20 @@ ${htmlSnippet.slice(0, 600)}`;
     };
   } catch (err) {
     const latencyMs = Math.round(performance.now() - t0);
+    const errorMsg = err?.message || "Unknown AI inference error";
     return {
       isBug: false,
       severity: "high",
-      shortReason: `AI audit failed (${issueType}): ${err.message}`,
+      shortReason: `AI audit failed (${issueType}): ${errorMsg}`,
       inferenceSource: "error",
       latencyMs,
-      error: err.message || "Unknown AI inference error",
+      error: errorMsg,
     };
   }
 }
 
 /**
- * Gọi Cloud Gemini 2.5 Flash (ONLY_IN_CLOUD) để phân tích sâu và sinh Unified Diff Patch.
+ * Gọi Cloud Gemini (ONLY_IN_CLOUD) để phân tích sâu và sinh Unified Diff Patch.
  */
 export async function generateCloudPatch(targetUrl, confirmedBugs) {
   const t0 = performance.now();
@@ -108,7 +128,7 @@ export async function generateCloudPatch(targetUrl, confirmedBugs) {
       .join("\n\n");
 
     return {
-      patchDiff: `# [DEMO MODE - Điền VITE_FIREBASE_API_KEY để gọi Gemini 2.5 Flash thật]\n\n${mockDiff}`,
+      patchDiff: `# [DEMO MODE - Điền VITE_FIREBASE_API_KEY để gọi Cloud AI thật]\n\n${mockDiff}`,
       inferenceSource: "demo",
       latencyMs: Math.round(performance.now() - t0),
       error: null,
@@ -133,7 +153,10 @@ ${JSON.stringify(
 Generate a clean, production-ready unified diff patch (\`\`\`diff ... \`\`\`) fixing all confirmed issues above. Keep explanations minimal.`;
 
   try {
-    const result = await cloudDeepModel.generateContent(prompt);
+    const result = await withTimeout(
+      cloudDeepModel.generateContent(prompt),
+      INFERENCE_TIMEOUT_MS
+    );
     const latencyMs = Math.round(performance.now() - t0);
 
     return {
@@ -148,7 +171,7 @@ Generate a clean, production-ready unified diff patch (\`\`\`diff ... \`\`\`) fi
       patchDiff: null,
       inferenceSource: "error",
       latencyMs,
-      error: err.message || "Failed to generate cloud patch",
+      error: err?.message || "Failed to generate cloud patch",
     };
   }
 }

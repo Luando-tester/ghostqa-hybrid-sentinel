@@ -11,6 +11,7 @@ import {
 } from "./scanner/hybridAuditor";
 
 const ESTIMATED_CLOUD_COST_PER_CHECK_USD = 0.0004;
+const CONCURRENCY_LIMIT = 4;
 
 export default function App() {
   const [url, setUrl] = useState("http://localhost:3000");
@@ -21,6 +22,7 @@ export default function App() {
   });
   const [initProgress, setInitProgress] = useState("");
   const [scanning, setScanning] = useState(false);
+  const [scanProgress, setScanProgress] = useState({ completed: 0, total: 0 });
   const [results, setResults] = useState([]);
   const [onDeviceCount, setOnDeviceCount] = useState(0);
   const [generatingFix, setGeneratingFix] = useState(false);
@@ -40,6 +42,7 @@ export default function App() {
     setScanning(true);
     setResults([]);
     setPatchResult(null);
+    setScanProgress({ completed: 0, total: 0 });
 
     // Gọi initializeDeviceModel() sau hành động click của người dùng
     await prepareHybridScanner((progressMsg) => {
@@ -68,25 +71,43 @@ export default function App() {
       candidates = localDom.length > 0 ? localDom : SAMPLE_CANDIDATES;
     }
 
-    const collected = [];
+    const total = candidates.length;
+    setScanProgress({ completed: 0, total });
 
-    for (const item of candidates) {
-      const verdict = await triageElementOnDevice(
-        item.htmlSnippet,
-        item.issueType,
-        setInitProgress
-      );
+    // Mảng giữ đúng thứ tự gốc của candidates khi chạy song song
+    const orderedResults = new Array(total).fill(null);
+    let nextIndex = 0;
+    let completedCount = 0;
 
-      // Chỉ đếm local check khi chạy thành công bằng on-device và không có lỗi
-      if (verdict.inferenceSource === "on-device" && !verdict.error) {
-        setOnDeviceCount((prev) => prev + 1);
-      }
+    async function worker() {
+      while (nextIndex < total) {
+        const currentIndex = nextIndex++;
+        const item = candidates[currentIndex];
 
-      if (verdict.isBug || verdict.error) {
-        collected.push({ ...item, ...verdict });
-        setResults([...collected]);
+        const verdict = await triageElementOnDevice(
+          item.htmlSnippet,
+          item.issueType,
+          setInitProgress
+        );
+
+        // Chỉ đếm local check khi chạy thành công bằng on-device và không có lỗi
+        if (verdict.inferenceSource === "on-device" && !verdict.error) {
+          setOnDeviceCount((prev) => prev + 1);
+        }
+
+        if (verdict.isBug || verdict.error) {
+          orderedResults[currentIndex] = { ...item, ...verdict };
+          setResults(orderedResults.filter(Boolean));
+        }
+
+        completedCount += 1;
+        setScanProgress({ completed: completedCount, total });
       }
     }
+
+    const workerCount = Math.min(CONCURRENCY_LIMIT, total);
+    const workers = Array.from({ length: workerCount }, () => worker());
+    await Promise.allSettled(workers);
 
     setScanning(false);
   }
@@ -148,7 +169,9 @@ export default function App() {
             GhostQA Local-First Sentinel
           </h2>
           <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 2 }}>
-            {initProgress || deviceInfo.reason}
+            {scanning && scanProgress.total > 0
+              ? `Đang quét ${scanProgress.completed}/${scanProgress.total} element...`
+              : initProgress || deviceInfo.reason}
           </div>
         </div>
         <div
@@ -214,7 +237,11 @@ export default function App() {
             fontSize: 13,
           }}
         >
-          {scanning ? "Scanning DOM..." : "Start Scan"}
+          {scanning
+            ? scanProgress.total > 0
+              ? `Scanning ${scanProgress.completed}/${scanProgress.total}...`
+              : "Initializing..."
+            : "Start Scan"}
         </button>
       </div>
 
@@ -303,7 +330,7 @@ export default function App() {
             }}
           >
             {generatingFix
-              ? "Calling Firebase Cloud (Gemini 2.5 Flash)..."
+              ? "Calling Cloud AI..."
               : `Generate Deep Fix (${validBugs.length} issues via Cloud AI)`}
           </button>
         </div>
